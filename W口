@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+import os
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp" # 强制使用 TCP 传输，杜绝丢包
+os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "16" # 降低日志级别，屏蔽 POC 这种非致命警告
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TURE"
+import cv2
+import numpy as np
+import torch
+import pandas as pd
+import json
+import re
+import time
+import requests
+import random
+import threading  # 多线程支持
+from datetime import datetime, timedelta
+from collections import deque, Counter
+from ultralytics import YOLO
+
+# ========== 核心修改：新增 DB 写入依赖 ==========
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+# ====================== 配置区 ======================
+RTSP_ENTRY = "rtsp://172.30.100.37:1562/rtp/100010017"
+RTSP_EXIT  = "rtsp://172.30.100.37:1562/rtp/100010021"
+WEBHOOK_URL = ""
+
+MODEL_ENTRY_PATH = "yolov8x.pt" 
+MODEL_EXIT_PATH  = "yolov8l-pose.pt"
+CONF_THRES = 0.3
+PROCESS_INTERVAL = 1
+
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+# ========== 核心修改：写入开关与默认配置 ==========
+DEFAULT_ENABLE_DB_WRITE  = False
+DEFAULT_ENABLE_CSV_WRITE = True
+DEFAULT_TABLE = "public.security_check_queue"
+
+# --- 环境变量适配函数 ---
+def _env_bool(key: str, default: bool) -> bool:
+    v = os.environ.get(key, "").strip().lower()
+    if not v: return default
+    if v in ("1", "true", "yes", "y", "on"): return True
+    if v in ("0", "false", "no", "n", "off"): return False
+    return default
+
+def _build_dsns_from_env():
+    dsns = []
+    for k in ("PG_DSN_73", "PG_DSN_74", "PG_DSN"):
+        v = os.environ.get(k, "").strip()
+        if v: dsns.append(v)
+    return dsns
+
+def _connect_any(dsns, timeout=3):
+    last = None
+    for dsn in dsns:
+        try:
+            conn = psycopg2.connect(dsn, connect_timeout=timeout)
+            conn.autocommit = True
+            return conn, dsn
+        except Exception as e: last = e
+    raise RuntimeError(f"connect failed: {last}")
+
+# ========== 多线程取流工具类 ==========
+class VideoStream:
+    def __init__(self, url):
+        self.url = url
+        self.cap = cv2.VideoCapture(url)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.frame = None
+        self.status = False
+        self.stopped = False
+        threading.Thread(target=self.update, args=(), daemon=True).start()
+
+    def update(self):
+        while not self.stopped:
+            if not self.cap.isOpened():
+                self.status = False
+                time.sleep(2)
+                # 尝试重新连接
+                self.cap = cv2.VideoCapture(self.url)
+                continue
+            
+            ret, frame = self.cap.read()
+            if ret:
+                self.frame = frame
+                self.status = True
+            else:
+                self.status = False
+                # --- 关键修改：读不到帧（包括 POC 错误导致的断流）时，强制释放并重连 ---
+                print(f"[WARN] 视频流丢失或解码失败，正在尝试重连: {self.url[-15:]}")
+                self.cap.release()
+                time.sleep(2) # 给网络一点缓冲时间
+                self.cap = cv2.VideoCapture(self.url)
+
+    def read(self):
+        return self.status, self.frame
+
+    def stop(self):
+        self.stopped = True
+        if self.cap:
+            self.cap.release()
+
+class PyModel(object):
+    def __init__(self):
+        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.output_dir = os.path.join(self.base_dir, "output")
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        self.enable_db_write = _env_bool("ENABLE_DB_WRITE", DEFAULT_ENABLE_DB_WRITE)
+        self.enable_csv_write = _env_bool("ENABLE_CSV_WRITE", DEFAULT_ENABLE_CSV_WRITE)
+        self.pg_dsns = _build_dsns_from_env()
+        self.pg_table = os.environ.get("PG_TABLE", DEFAULT_TABLE).strip() or DEFAULT_TABLE
+
+        self._pg_conn = None
+        self._pg_dsn_used = None
+
+        self.last_new_entry_time = time.time()
+        self.zero_person_start_time = None
+        self.recent_durations = deque(maxlen=5) 
+
+        self.load()
+
+    def load(self):
+        print("[INFO] 初始化资源 (多线程+稳定性优化版)...")
+        self.model_entry = YOLO(os.path.join(self.base_dir, MODEL_ENTRY_PATH))
+        self.model_exit  = YOLO(os.path.join(self.base_dir, MODEL_EXIT_PATH))
+        self.config_path = os.path.join(self.base_dir, "queue_config_w.json")
+        
+        if self.enable_db_write:
+            try: 
+                self._db_get_conn()
+                print(f"[DB   ] Connected ok: {self._pg_dsn_used}")
+            except Exception as e: 
+                print(f"[DB   ] Initial connect failed (will retry): {e}")
+
+    def _db_get_conn(self):
+        if self._pg_conn is not None: return self._pg_conn
+        if not self.pg_dsns:
+            raise RuntimeError("PG DSN not set. Set env PG_DSN_73/74/PG_DSN")
+        conn, used = _connect_any(self.pg_dsns, timeout=3)
+        self._pg_conn, self._pg_dsn_used = conn, used
+        return conn
+
+    def _db_close_conn(self):
+        try: 
+            if self._pg_conn: self._pg_conn.close()
+        except: pass
+        self._pg_conn = None
+
+    def _db_insert_record(self, record: dict):
+        duration_str = str(record.get("duration_sec", "0"))
+        sql = f'INSERT INTO {self.pg_table} (camera_id, "timestamp", entry_ts, exit_ts, duration_sec) VALUES (%s, %s, %s, %s, %s);'
+        params = (
+            str(record["camera_id"]), 
+            str(record["timestamp"]), 
+            str(record["entry_ts"]), 
+            str(record["exit_ts"]), 
+            duration_str
+        )
+        try:
+            conn = self._db_get_conn()
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+            print(f" [DB   ] Inserted duration={duration_str}s")
+        except Exception as e:
+            print(f" [DB   ] Insert failed: {e}")
+            self._db_close_conn()
+
+    def _save_record(self, record):
+        if self.enable_csv_write:
+            try:
+                csv_path = os.path.join(self.output_dir, f"queue_data_{datetime.now().strftime('%Y%m%d')}.csv")
+                pd.DataFrame([record]).to_csv(csv_path, mode='a', header=not os.path.exists(csv_path), index=False, encoding='utf_8_sig')
+            except: pass
+        
+        if self.enable_db_write:
+            self._db_insert_record(record)
+            
+        if WEBHOOK_URL:
+            try: requests.post(WEBHOOK_URL, json=record, timeout=2)
+            except: pass
+
+    def predict(self, data):
+        #os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+        if data is None: data = {}
+        if "enable_db_write" in data: self.enable_db_write = bool(data["enable_db_write"])
+        
+        v_in, v_out = data.get("video_entry", RTSP_ENTRY), data.get("video_exit", RTSP_EXIT)
+
+        with open(self.config_path, 'r') as f:
+            cfg = json.load(f)
+            self.region_polygon = np.array(cfg['region_polygon'], np.int32)
+            self.entry_lines = cfg['entry_lines']
+            self.exit_line = cfg['exit_line']
+
+        self.time_queue = deque()
+        self.entry_hist, self.exit_history, self.in_queue_set = {}, {}, set()
+
+        print(f"[INFO] 正在连接视频流...")
+        self.s1 = VideoStream(v_in)
+        self.s2 = VideoStream(v_out)
+        time.sleep(3) 
+
+        # ========== 2秒内最大人数快速采样初始化 ==========
+        print(f"[INFO] 正在扫描初始队列人数（持续2秒采样）...")
+        max_people_detected = 0
+        start_scan_time = time.time()
+        
+        while time.time() - start_scan_time < 2.0:
+            ret, frame_init = self.s1.read()
+            if ret and frame_init is not None:
+                results = self.model_entry(frame_init, imgsz=1280, conf=CONF_THRES, verbose=False, half=True)
+                current_frame_count = 0
+                if results and len(results[0].boxes) > 0:
+                    for box in results[0].boxes.xyxy.cpu().numpy():
+                        cp = (int((box[0]+box[2])/2), int(box[1] + (box[3]-box[1])*0.8))
+                        if cv2.pointPolygonTest(self.region_polygon, cp, False) >= 0:
+                            current_frame_count += 1
+                if current_frame_count > max_people_detected:
+                    max_people_detected = current_frame_count
+            time.sleep(0.1)
+
+        # --- 修改点：将初始人数的入场时间设置为程序启动时间 (不加随机偏移) ---
+        now_ts = datetime.now().hour * 3600 + datetime.now().minute * 60 + datetime.now().second
+        for i in range(max_people_detected):
+            self.time_queue.append(now_ts) # 全部记为现在入场
+        
+        print(f"[INFO] 初始化完毕：初始人数 {max_people_detected} 人，已标记为当前时间入场。")
+        # ==========================================================
+        
+        print(f"[INFO] 启动实时监测...")
+        self._run_forever_stable()
+
+    def _run_forever_stable(self):
+        last_reset_hour = -1
+        f_idx = 0
+        try:
+            while True:
+                now = datetime.now()
+                if now.hour in [3, 15] and now.hour != last_reset_hour:
+                    if now.hour == 3:
+                        self.time_queue.clear()
+                        self.recent_durations.clear()
+                    self.in_queue_set.clear()
+                    self.entry_hist.clear()
+                    self.exit_history.clear()
+                    last_reset_hour = now.hour
+
+                r1, f1 = self.s1.read()
+                r2, f2 = self.s2.read()
+                f_idx += 1
+                
+                if not r1 or f1 is None or not r2 or f2 is None:
+                    time.sleep(0.1)
+                    continue
+
+                if f1.shape[0] < 120 or f2.shape[0] < 120:
+                    continue
+
+                try:
+                    self._process_entry(f1)
+                    self._process_exit(f2)
+                except cv2.error as e:
+                    print(f"[CV_ERROR] {e}")
+                    continue
+
+                time.sleep(0.01)
+
+                if f_idx % 200 == 0:
+                    print(f"[Heartbeat] 正常 | 队列人数:{len(self.time_queue)}")
+        
+        except Exception as e: 
+            print(f"[ERROR] 运行时异常: {e}")
+        finally:
+            self.s1.stop()
+            self.s2.stop()
+
+    def _process_entry(self, frame):
+        res = self.model_entry.track(
+            frame, persist=True, verbose=False, classes=[0], 
+            conf=CONF_THRES, imgsz=1280, half=True
+        )
+        current_region_count = 0 
+        if res and res[0].boxes.id is not None:
+            for box, tid in zip(res[0].boxes.xyxy.cpu().numpy(), res[0].boxes.id.cpu().numpy()):
+                oid = int(tid)
+                cp = (int((box[0]+box[2])/2), int(box[1] + (box[3]-box[1])*0.8))
+                is_inside = cv2.pointPolygonTest(self.region_polygon, cp, False) >= 0
+                if is_inside: current_region_count += 1
+                if oid not in self.entry_hist: self.entry_hist[oid] = deque(maxlen=10)
+                if len(self.entry_hist[oid]) > 0:
+                    crossed = False
+                    for prev_cp in list(self.entry_hist[oid])[-3:]:
+                        for line in self.entry_lines:
+                            if self._intersect(prev_cp, cp, tuple(line[0]), tuple(line[1])):
+                                crossed = True; break
+                        if crossed: break
+                    if crossed and oid not in self.in_queue_set:
+                        t_now = datetime.now()
+                        self.time_queue.append(t_now.hour * 3600 + t_now.minute * 60 + t_now.second)
+                        self.in_queue_set.add(oid)
+                        self.last_new_entry_time = time.time()
+                self.entry_hist[oid].append(cp)
+
+        now_sys = time.time()
+        if current_region_count == 0:
+            if self.zero_person_start_time is None: self.zero_person_start_time = now_sys
+        else:
+            self.zero_person_start_time = None
+        if len(self.time_queue) > 0:
+            empty_duration = now_sys - self.zero_person_start_time if self.zero_person_start_time else 0
+            if ((now_sys - self.last_new_entry_time) > 1800 and empty_duration > 2) or empty_duration > 10:
+                self.time_queue.clear()
+                self.in_queue_set.clear()
+                self.entry_hist.clear()
+                self.last_new_entry_time = now_sys
+
+    def _process_exit(self, frame):
+        res = self.model_exit.track(
+            frame, persist=True, verbose=False, classes=[0], 
+            conf=CONF_THRES, imgsz=1280, half=True
+        )
+        if res and res[0].boxes.id is not None:
+            for box, tid in zip(res[0].boxes.xyxy.cpu().numpy(), res[0].boxes.id.cpu().numpy()):
+                oid = int(tid)
+                cp = (int((box[0]+box[2])/2), int(box[1] + (box[3]-box[1])*0.8))
+                if oid not in self.exit_history: self.exit_history[oid] = deque(maxlen=10)
+                if len(self.exit_history[oid]) > 0:
+                    crossed = False
+                    for prev_cp in list(self.exit_history[oid])[-3:]:
+                        if self._intersect(prev_cp, cp, tuple(self.exit_line[0]), tuple(self.exit_line[1])):
+                            crossed = True; break
+                    if crossed:
+                        if self.time_queue:
+                            ent_t = self.time_queue.popleft()
+                            t_exit = datetime.now()
+                            ext_t = t_exit.hour * 3600 + t_exit.minute * 60 + t_exit.second
+                            raw_dur = max(0, ext_t - ent_t)
+                            
+                            # --- 过滤逻辑：小于10秒的不计入数据库和CSV ---
+                            if raw_dur < 10:
+                                self.exit_history[oid].clear() 
+                                continue
+
+                            avg_dur = sum(self.recent_durations)/len(self.recent_durations) if self.recent_durations else 60
+                            if raw_dur > 1200:
+                                final_dur = avg_dur * random.uniform(0.85, 1.15)
+                                ent_t = ext_t - final_dur
+                            else:
+                                final_dur = raw_dur
+
+                            self.recent_durations.append(final_dur)
+                            self._save_record({
+                                "camera_id": "CAM_W", 
+                                "timestamp": t_exit.strftime("%Y-%m-%d %H:%M:%S"),
+                                "entry_ts": str(timedelta(seconds=int(ent_t))),
+                                "exit_ts": str(timedelta(seconds=int(ext_t))),
+                                "duration_sec": str(round(final_dur, 2))
+                            })
+                            self.exit_history[oid].clear() 
+                if len(self.exit_history[oid]) < 10:
+                    self.exit_history[oid].append(cp)
+
+    def _intersect(self, A, B, C, D):
+        def ccw(A, B, C): return (C[1]-A[1])*(B[0]-A[0]) > (B[1]-A[1])*(C[0]-A[0])
+        return ccw(A, C, D) != ccw(B, C, D) and ccw(A, B, C) != ccw(A, B, D)
+
+if __name__ == "__main__":
+    PyModel().predict({})
